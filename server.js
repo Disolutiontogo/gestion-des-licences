@@ -59,30 +59,25 @@ app.post('/interactions', express.raw({ type: 'application/json' }), async (req,
     });
     const sheets = google.sheets({ version: 'v4', auth });
 
-    // ---- ID client alphanumérique, unique, format CLT-XXXXX ----
-    function randomAlphanum(size = 5) {
-      const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
-      let out = '';
-      for (let i = 0; i < size; i++) out += chars[Math.floor(Math.random() * chars.length)];
-      return out;
+    // ---- ID client incrémental alphanumérique (CLT-00001, CLT-00002, etc.) ----
+    const read = await sheets.spreadsheets.values.get({
+      spreadsheetId: process.env.SHEET_ID,
+      range: 'FormResponses!C:C'
+    });
+    const ids = (read.data.values || [])
+      .map(row => row[0])
+      .filter(val => val && /^CLT-\d+$/.test(val));
+    let lastNum = 0;
+    if (ids.length > 0) {
+      // Prend la partie numérique du dernier ID
+      const matches = ids[ids.length - 1].match(/^CLT-(\d+)$/);
+      if (matches) lastNum = parseInt(matches[1], 10);
     }
-    let clientId = `CLT-${randomAlphanum(5)}`;
-    // Vérifier l'unicité dans la Sheet
-    let isUnique = false;
-    while (!isUnique) {
-      const read = await sheets.spreadsheets.values.get({
-        spreadsheetId: process.env.SHEET_ID,
-        range: 'FormResponses!C:C'
-      });
-      const ids = (read.data.values || []).map(row => row[0]);
-      if (!ids.includes(clientId)) {
-        isUnique = true;
-      } else {
-        clientId = `CLT-${randomAlphanum(5)}`;
-      }
-    }
+    const nextNum = lastNum + 1;
+    const clientId = `CLT-${String(nextNum).padStart(5, '0')}`;
+    // Exemple: CLT-00001, CLT-00002, ...
 
-    // Ajoute la nouvelle ligne dans la sheet (clientId alphanum)
+    // Ajoute la nouvelle ligne dans la sheet
     await sheets.spreadsheets.values.append({
       spreadsheetId: process.env.SHEET_ID,
       range: 'FormResponses!A:E',
