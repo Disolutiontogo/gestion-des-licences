@@ -19,140 +19,124 @@ function formatDate(date) {
   return `${day}/${month}/${year}`;
 }
 
-// --------- Discord Bot UNIQUE INSTANCE ---------
+// Un seul client Discord global
 const discordClient = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers],
   partials: [Partials.GuildMember],
 });
 discordClient.login(process.env.BOT_TOKEN);
-
 discordClient.once('ready', () => {
   console.log('🤖 Discord bot connecté !');
 });
 
-// ---------- Discord Interactions Secure ----------
+// ROUTE INTERACTIONS (Discord)
 app.post('/interactions', express.raw({ type: 'application/json' }), async (req, res) => {
   const signature = req.headers['x-signature-ed25519'];
   const timestamp = req.headers['x-signature-timestamp'];
   const rawBody = req.body.toString();
 
-  // --- Vérification signature Discord ---
+  // Vérification signature Discord
   const isVerified = nacl.sign.detached.verify(
     Buffer.from(timestamp + rawBody),
     Buffer.from(signature, 'hex'),
     Buffer.from(process.env.PUBLIC_KEY, 'hex')
   );
-  if (!isVerified) {
-    return res.status(401).send('invalid request signature');
-  }
+  if (!isVerified) return res.status(401).send('invalid request signature');
 
   let body;
   try {
     body = JSON.parse(rawBody);
-  } catch (e) {
+  } catch {
     return res.status(400).send('invalid JSON');
   }
 
-  // --- PING Discord ---
+  // Ping Discord
   if (body.type === 1) {
     return res.json({ type: 1 });
   }
 
   try {
-    // --- Réponse rapide pour éviter le timeout Discord ---
-    res.json({ type: 4, data: { content: "⏳ Validation en cours…" } });
+    // Infos commande
+    const data = body.data;
+    const userId = data.options.find(o => o.name === 'user').value;
+    const proof = data.options.find(o => o.name === 'proof').value;
 
-    // --- TRAITEMENT ASYNC EN TACHE DE FOND ---
-    (async () => {
-      const data = body.data;
-      const userId = data.options.find(o => o.name === 'user').value;
-      const proof = data.options.find(o => o.name === 'proof').value;
+    // Dates
+    const now = new Date();
+    const startDate = formatDate(now);
+    const expDate = formatDate(new Date(now.getTime() + 365 * 24 * 60 * 60 * 1000));
 
-      // Dates
-      const now = new Date();
-      const startDate = formatDate(now);
-      const expDate = formatDate(new Date(now.getTime() + 365 * 24 * 60 * 60 * 1000));
+    // Google Sheets
+    const credentials = JSON.parse(process.env.GOOGLE_CREDS);
+    const auth = new google.auth.GoogleAuth({
+      credentials,
+      scopes: ['https://www.googleapis.com/auth/spreadsheets'],
+    });
+    const sheets = google.sheets({ version: 'v4', auth });
 
-      // Google Sheets setup
-      const credentials = JSON.parse(process.env.GOOGLE_CREDS);
-      const auth = new google.auth.GoogleAuth({
-        credentials,
-        scopes: ['https://www.googleapis.com/auth/spreadsheets'],
-      });
-      const sheets = google.sheets({ version: 'v4', auth });
-
-      // --- Génération ID client random alphanumérique unique (CLT-XXXXX) ---
-      function randomAlphanum(size = 5) {
-        const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
-        let out = '';
-        for (let i = 0; i < size; i++) out += chars[Math.floor(Math.random() * chars.length)];
-        return out;
-      }
-      let clientId, unique = false, essais = 0;
-      while (!unique && essais < 15) {
-        essais++;
-        clientId = `CLT-${randomAlphanum(5)}`;
-        const read = await sheets.spreadsheets.values.get({
-          spreadsheetId: process.env.SHEET_ID,
-          range: 'FormResponses!C:C'
-        });
-        const ids = (read.data.values || []).map(row => row[0]);
-        if (!ids.includes(clientId)) unique = true;
-      }
-      if (!clientId) clientId = `CLT-ERR${Date.now()}`;
-
-      // Ajout Google Sheet
-      await sheets.spreadsheets.values.append({
+    // --- ID client incrémental sur 5 chiffres ---
+    let clientId = '00001';
+    try {
+      const read = await sheets.spreadsheets.values.get({
         spreadsheetId: process.env.SHEET_ID,
-        range: 'FormResponses!A:E',
-        valueInputOption: 'USER_ENTERED',
-        resource: {
-          values: [[userId, proof, clientId, startDate, expDate]]
-        }
+        range: 'FormResponses!C:C'
       });
+      const ids = (read.data.values || [])
+        .map(row => row[0])
+        .filter(val => val && /^\d+$/.test(val));
+      let lastNum = 0;
+      if (ids.length > 0) lastNum = parseInt(ids[ids.length - 1], 10);
+      clientId = String(lastNum + 1).padStart(5, '0');
+    } catch (e) {
+      console.log("Erreur lecture IDs:", e.message);
+    }
 
-      // --- Attribution des rôles Discord ---
-      try {
-        // Attendre que le bot soit prêt si besoin
-        if (!discordClient.isReady()) {
-          await new Promise(resolve => discordClient.once('ready', resolve));
-        }
-        const guild = await discordClient.guilds.fetch(process.env.GUILD_ID);
-        const member = await guild.members.fetch(userId);
-        const clientRole = guild.roles.cache.find(r => r.name === "client");
-        const prospectRole = guild.roles.cache.find(r => r.name === "prospect");
-
-        if (clientRole && member) {
-          await member.roles.add(clientRole);
-          if (prospectRole && member.roles.cache.has(prospectRole.id)) {
-            await member.roles.remove(prospectRole);
-          }
-          try {
-            await member.send(`🎉 Paiement validé, tu as reçu le rôle client pour 1 an (jusqu’au ${expDate}) ! Ton ID client est ${clientId}`);
-          } catch (e) {
-            console.log("Impossible d’envoyer le DM à ce membre (DM fermés).");
-          }
-        }
-
-        // EDIT DU MESSAGE INITIAL dans Discord si tu veux (optionnel)
-
-      } catch (e) {
-        console.error('Erreur Discord roles:', e);
+    // Ajoute à la feuille
+    await sheets.spreadsheets.values.append({
+      spreadsheetId: process.env.SHEET_ID,
+      range: 'FormResponses!A:E',
+      valueInputOption: 'USER_ENTERED',
+      resource: {
+        values: [[userId, proof, clientId, startDate, expDate]]
       }
-    })();
+    });
+
+    // Attribution des rôles Discord
+    try {
+      const guild = await discordClient.guilds.fetch(process.env.GUILD_ID);
+      const member = await guild.members.fetch(userId);
+      const clientRole = guild.roles.cache.find(r => r.name === "client");
+      const prospectRole = guild.roles.cache.find(r => r.name === "prospect");
+
+      if (clientRole && member) {
+        await member.roles.add(clientRole);
+        if (prospectRole && member.roles.cache.has(prospectRole.id)) {
+          await member.roles.remove(prospectRole);
+        }
+      }
+    } catch (e) {
+      console.log("Erreur Discord roles:", e.message);
+    }
+
+    // Réponse DIRECTE dans Discord, complète et instantanée
+    return res.json({
+      type: 4,
+      data: {
+        content:
+          `✅ Validation réussie pour <@${userId}>.\n• ID client : ${clientId}\n• Début de licence : ${startDate}\n• Expiration : ${expDate}\n\n🎉 Le rôle client a été attribué automatiquement !`
+      }
+    });
 
   } catch (err) {
     console.error('Erreur sur /interactions:', err);
-    if (!res.headersSent) {
-      res.json({
-        type: 4,
-        data: { content: '❌ Erreur lors de la validation. Merci de réessayer.' }
-      });
-    }
+    return res.json({
+      type: 4,
+      data: { content: '❌ Erreur lors de la validation. Merci de réessayer.' }
+    });
   }
 });
 
-// --- CRON notifications de rappel automatisées ---
+// CRON pour les rappels (inchangé)
 cron.schedule('0 10 * * *', async () => {
   try {
     const credentials = JSON.parse(process.env.GOOGLE_CREDS);
@@ -197,7 +181,6 @@ cron.schedule('0 10 * * *', async () => {
   }
 });
 
-// --- Express écoute sur le port Render ou local ---
 app.listen(process.env.PORT || 3000, () => {
   console.log("Server ready on http://localhost:" + (process.env.PORT || 3000));
 });
