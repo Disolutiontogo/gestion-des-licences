@@ -6,30 +6,6 @@ import dotenv from 'dotenv';
 
 dotenv.config();
 
-client.on('guildMemberAdd', async member => {
-  // Vérifie que c'est bien sur TON serveur (optionnel si ton bot est sur plusieurs serveurs)
-  if (member.guild.id !== process.env.GUILD_ID) return;
-
-  // Cherche le rôle "prospect"
-  const role = member.guild.roles.cache.find(r => r.name === 'prospect');
-  if (role) {
-    try {
-      await member.roles.add(role);
-      console.log(`Rôle 'prospect' attribué à ${member.user.tag}`);
-      // (Optionnel) Envoie un DM au nouveau membre
-      try {
-        await member.send("Bienvenue sur le serveur ! Tu as le rôle prospect. Reste attentif pour passer client !");
-      } catch (e) {
-        console.log("Impossible d’envoyer le DM au membre.");
-      }
-    } catch (e) {
-      console.log(`Erreur lors de l'attribution du rôle prospect à ${member.user.tag} :`, e.message);
-    }
-  } else {
-    console.log("Rôle 'prospect' introuvable !");
-  }
-});
-
 
 const app = express();
 app.use(express.json());
@@ -160,6 +136,30 @@ cron.schedule('0 10 * * *', async () => { // tous les jours à 10h (UTC)
     }
   } catch (e) {
     console.log("Erreur CRON Google Sheets :", e.message);
+  }
+});
+
+client.on('guildMemberAdd', async member => {
+  // Vérifie que c'est bien sur TON serveur (optionnel si ton bot est sur plusieurs serveurs)
+  if (member.guild.id !== process.env.GUILD_ID) return;
+
+  // Cherche le rôle "prospect"
+  const role = member.guild.roles.cache.find(r => r.name === 'prospect');
+  if (role) {
+    try {
+      await member.roles.add(role);
+      console.log(`Rôle 'prospect' attribué à ${member.user.tag}`);
+      // (Optionnel) Envoie un DM au nouveau membre
+      try {
+        await member.send("Bienvenue sur le serveur ! Tu as le rôle prospect. Reste attentif pour passer client !");
+      } catch (e) {
+        console.log("Impossible d’envoyer le DM au membre.");
+      }
+    } catch (e) {
+      console.log(`Erreur lors de l'attribution du rôle prospect à ${member.user.tag} :`, e.message);
+    }
+  } else {
+    console.log("Rôle 'prospect' introuvable !");
   }
 });
 
