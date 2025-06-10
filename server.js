@@ -45,20 +45,25 @@ app.post('/interactions', async (req, res) => {
     const userId = data.options.find(o => o.name === 'user').value;
     const proof = data.options.find(o => o.name === 'proof').value;
 
-    // Sheets: ajoute l'utilisateur
+    // Dates
     const now = new Date();
     const startDate = now.toISOString().slice(0, 10);
     const expDate = new Date(now.getTime() + 365 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
 
-    // Génére l’ID client (optionnel)
-    // Récupère la dernière ligne pour incrémenter
+    // 🔑 Génération de l’ID client séquentiel fiable
     const read = await sheets.spreadsheets.values.get({
       spreadsheetId: process.env.SHEET_ID,
       range: 'FormResponses!C:C'
     });
-    const nextIdNum = read.data.values && read.data.values.length ? parseInt(read.data.values.slice(-1)[0][0] || "0", 10) + 1 : 1;
+    // Ne garde que les IDs numériques existants
+    const ids = (read.data.values || [])
+      .map(row => row[0])
+      .filter(val => val && !isNaN(val));
+    const lastId = ids.length > 0 ? parseInt(ids[ids.length - 1], 10) : 0;
+    const nextIdNum = lastId + 1;
     const clientId = ("00000" + nextIdNum).slice(-5);
 
+    // Ajoute la nouvelle ligne dans la sheet
     await sheets.spreadsheets.values.append({
       spreadsheetId: process.env.SHEET_ID,
       range: 'FormResponses!A:E',
