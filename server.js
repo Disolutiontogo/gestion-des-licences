@@ -1,81 +1,144 @@
 import express from 'express';
-import { verifyKey } from 'discord-interactions';
+import { Client, GatewayIntentBits, Partials } from 'discord.js';
 import { google } from 'googleapis';
-import nacl from 'tweetnacl';
-import 'dotenv/config';
+import cron from 'node-cron';
+import dotenv from 'dotenv';
+
+dotenv.config();
+
+const app = express();
+app.use(express.json());
+
+// Discord bot setup
+const client = new Client({
+  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers],
+  partials: [Partials.GuildMember],
+});
+
+client.login(process.env.BOT_TOKEN);
+
+client.once('ready', () => {
+  console.log('🤖 Discord bot connecté !');
+});
+
+// Google Sheets setup
 const credentials = JSON.parse(process.env.GOOGLE_CREDS);
 
-const {
-  PUBLIC_KEY, BOT_TOKEN,
-  APPLICATION_ID, GUILD_ID,
-  SHEET_ID, PORT = 3000
-} = process.env;
-
-// Initialisation Google Sheets
 const auth = new google.auth.GoogleAuth({
   credentials,
   scopes: ['https://www.googleapis.com/auth/spreadsheets'],
 });
 const sheets = google.sheets({ version: 'v4', auth });
 
-const app = express();
-app.use(express.json({
-  verify: (req, res, buf) => { req.rawBody = buf; }
-}));
-
+// Endpoint Discord Interactions
 app.post('/interactions', async (req, res) => {
-  const signature = req.get('X-Signature-Ed25519');
-  const timestamp = req.get('X-Signature-Timestamp');
-  if (!verifyKey(req.rawBody, signature, timestamp, PUBLIC_KEY)) {
-    return res.status(401).send('invalid request signature');
-  }
+  try {
+    const body = req.body;
 
-  const { type, data } = req.body;
-  if (type === 1) {
-    return res.json({ type: 1 });
-  }
-
-  // Récupère options
-  const userId = data.options.find(o => o.name === 'user').value;
-  const proof  = data.options.find(o => o.name === 'proof').value;
-
-  // Dates & ID client
-  const now = new Date();
-  const startDate = now.toISOString().split('T')[0];
-  const expDate   = new Date(now.getTime() + 365*24*3600*1000)
-                      .toISOString().split('T')[0];
-
-  // Lecture de la feuille pour générer l’ID séquentiel
-  const sheetRes = await sheets.spreadsheets.values.get({
-    spreadsheetId: SHEET_ID, range: 'FormResponses!A:C'
-  });
-  const rows = sheetRes.data.values || [];
-  const lastId = rows.length > 1 ? parseInt(rows[rows.length-1][2],10) : 0;
-  const clientId = String(lastId + 1).padStart(5, '0');
-
-  // Append
-  await sheets.spreadsheets.values.append({
-    spreadsheetId: SHEET_ID,
-    range: 'FormResponses!A:E',
-    valueInputOption: 'RAW',
-    requestBody: {
-      values: [[userId, proof, clientId, startDate, expDate]]
+    // Répond au ping Discord
+    if (body.type === 1) {
+      return res.json({ type: 1 });
     }
-  });
 
-  // Réponse Discord
-  return res.json({
-    type: 4,
-    data: {
-      content:
-        `✅ Validation réussie pour <@${userId}>\n` +
-        `• ID client : ${clientId}\n` +
-        `• Début : ${startDate}\n` +
-        `• Expire : ${expDate}\n\n` +
-        `\`\`\`?give-role @${userId} client 365d\`\`\``
+    // Récupère les infos de la commande
+    const data = body.data;
+    const userId = data.options.find(o => o.name === 'user').value;
+    const proof = data.options.find(o => o.name === 'proof').value;
+
+    // Sheets: ajoute l'utilisateur
+    const now = new Date();
+    const startDate = now.toISOString().slice(0, 10);
+    const expDate = new Date(now.getTime() + 365 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+
+    // Génére l’ID client (optionnel)
+    // Récupère la dernière ligne pour incrémenter
+    const read = await sheets.spreadsheets.values.get({
+      spreadsheetId: process.env.SHEET_ID,
+      range: 'FormResponses!C:C'
+    });
+    const nextIdNum = read.data.values && read.data.values.length ? parseInt(read.data.values.slice(-1)[0][0] || "0", 10) + 1 : 1;
+    const clientId = ("00000" + nextIdNum).slice(-5);
+
+    await sheets.spreadsheets.values.append({
+      spreadsheetId: process.env.SHEET_ID,
+      range: 'FormResponses!A:E',
+      valueInputOption: 'USER_ENTERED',
+      resource: {
+        values: [[userId, proof, clientId, startDate, expDate]]
+      }
+    });
+
+    // Discord: ajoute le rôle client au membre
+    const guild = await client.guilds.fetch(process.env.GUILD_ID);
+    const member = await guild.members.fetch(userId);
+    const role = guild.roles.cache.find(r => r.name === "client");
+
+    if (role && member) {
+      await member.roles.add(role);
+
+      // Message privé à l'utilisateur
+      try {
+        await member.send(`🎉 Paiement validé, tu as reçu le rôle client pour 1 an (jusqu’au ${expDate}) !`);
+      } catch (e) {
+        console.log("Impossible d’envoyer le DM à ce membre (DM fermés).");
+      }
     }
-  });
+
+    // Répond dans Discord
+    res.json({
+      type: 4,
+      data: {
+        content:
+          `✅ Validation réussie pour <@${userId}>.\n• ID client : ${clientId}\n• Début de licence : ${startDate}\n• Expiration : ${expDate}\n\n🎉 Le rôle client a été attribué automatiquement !`
+      }
+    });
+
+  } catch (err) {
+    console.error('Erreur sur /interactions:', err);
+    res.json({
+      type: 4,
+      data: { content: '❌ Erreur lors de la validation. Merci de réessayer.' }
+    });
+  }
 });
 
-app.listen(PORT, () =>
-  console.log(`Server ready on http://localhost:${PORT}`));
+// Notifications de rappel automatisées
+cron.schedule('0 10 * * *', async () => { // tous les jours à 10h (UTC)
+  try {
+    const resp = await sheets.spreadsheets.values.get({
+      spreadsheetId: process.env.SHEET_ID,
+      range: 'FormResponses!A:E'
+    });
+    const today = new Date();
+    const reminders = [
+      { days: 30, msg: "dans 1 mois" },
+      { days: 14, msg: "dans 2 semaines" },
+      { days: 1, msg: "demain" }
+    ];
+
+    if (!resp.data.values) return;
+
+    for (let row of resp.data.values) {
+      const [userId, , , , expDate] = row;
+      if (!userId || !expDate) continue;
+      const diff = Math.ceil((new Date(expDate) - today) / (1000 * 3600 * 24));
+      const reminder = reminders.find(r => r.days === diff);
+      if (reminder) {
+        try {
+          const guild = await client.guilds.fetch(process.env.GUILD_ID);
+          const member = await guild.members.fetch(userId);
+          await member.send(`⏰ Rappel : ton rôle client expire ${reminder.msg} (le ${expDate}). Pense à renouveler ton accès !`);
+        } catch (e) {
+          console.log("Rappel impossible à ", userId, e.message);
+        }
+      }
+    }
+  } catch (e) {
+    console.log("Erreur CRON Google Sheets :", e.message);
+  }
+});
+
+// Express écoute sur le port Render
+app.listen(process.env.PORT || 3000, () => {
+  console.log("Server ready on http://localhost:" + (process.env.PORT || 3000));
+});
