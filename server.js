@@ -3,7 +3,7 @@ import { verifyKey } from 'discord-interactions';
 import { google } from 'googleapis';
 import nacl from 'tweetnacl';
 import 'dotenv/config';
-import fs from 'fs';
+const credentials = JSON.parse(process.env.GOOGLE_CREDS);
 
 const {
   PUBLIC_KEY, BOT_TOKEN,
@@ -13,7 +13,7 @@ const {
 
 // Initialisation Google Sheets
 const auth = new google.auth.GoogleAuth({
-  credentials: JSON.parse(fs.readFileSync('credentials.json')),
+  credentials,
   scopes: ['https://www.googleapis.com/auth/spreadsheets'],
 });
 const sheets = google.sheets({ version: 'v4', auth });
