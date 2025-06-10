@@ -30,6 +30,15 @@ const auth = new google.auth.GoogleAuth({
 });
 const sheets = google.sheets({ version: 'v4', auth });
 
+// Fonction utilitaire pour format JJ/MM/AAAA
+function formatDate(date) {
+  const d = new Date(date);
+  const day = String(d.getDate()).padStart(2, '0');
+  const month = String(d.getMonth() + 1).padStart(2, '0');
+  const year = d.getFullYear();
+  return `${day}/${month}/${year}`;
+}
+
 // Endpoint Discord Interactions
 app.post('/interactions', async (req, res) => {
   try {
@@ -47,10 +56,10 @@ app.post('/interactions', async (req, res) => {
 
     // Dates
     const now = new Date();
-    const startDate = now.toISOString().slice(0, 10);
-    const expDate = new Date(now.getTime() + 365 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+    const startDate = formatDate(now);
+    const expDate = formatDate(new Date(now.getTime() + 365 * 24 * 60 * 60 * 1000));
 
-    // 🔑 Génération de l’ID client séquentiel fiable
+    // Génération de l’ID client séquentiel fiable
     const read = await sheets.spreadsheets.values.get({
       spreadsheetId: process.env.SHEET_ID,
       range: 'FormResponses!C:C'
@@ -124,15 +133,20 @@ cron.schedule('0 10 * * *', async () => { // tous les jours à 10h (UTC)
     if (!resp.data.values) return;
 
     for (let row of resp.data.values) {
-      const [userId, , , , expDate] = row;
-      if (!userId || !expDate) continue;
-      const diff = Math.ceil((new Date(expDate) - today) / (1000 * 3600 * 24));
+      const [userId, , , , expDateStr] = row;
+      if (!userId || !expDateStr) continue;
+
+      // Reconvertir la date au format ISO pour le calcul de différence de jours
+      const [day, month, year] = expDateStr.split('/');
+      const expDate = new Date(`${year}-${month}-${day}`);
+
+      const diff = Math.ceil((expDate - today) / (1000 * 3600 * 24));
       const reminder = reminders.find(r => r.days === diff);
       if (reminder) {
         try {
           const guild = await client.guilds.fetch(process.env.GUILD_ID);
           const member = await guild.members.fetch(userId);
-          await member.send(`⏰ Rappel : ton rôle client expire ${reminder.msg} (le ${expDate}). Pense à renouveler ton accès !`);
+          await member.send(`⏰ Rappel : ton rôle client expire ${reminder.msg} (le ${expDateStr}). Pense à renouveler ton accès !`);
         } catch (e) {
           console.log("Rappel impossible à ", userId, e.message);
         }
