@@ -30,15 +30,6 @@ const auth = new google.auth.GoogleAuth({
 });
 const sheets = google.sheets({ version: 'v4', auth });
 
-// Fonction utilitaire pour format JJ/MM/AAAA
-function formatDate(date) {
-  const d = new Date(date);
-  const day = String(d.getDate()).padStart(2, '0');
-  const month = String(d.getMonth() + 1).padStart(2, '0');
-  const year = d.getFullYear();
-  return `${day}/${month}/${year}`;
-}
-
 // Endpoint Discord Interactions
 app.post('/interactions', async (req, res) => {
   try {
@@ -54,25 +45,20 @@ app.post('/interactions', async (req, res) => {
     const userId = data.options.find(o => o.name === 'user').value;
     const proof = data.options.find(o => o.name === 'proof').value;
 
-    // Dates
+    // Sheets: ajoute l'utilisateur
     const now = new Date();
-    const startDate = formatDate(now);
-    const expDate = formatDate(new Date(now.getTime() + 365 * 24 * 60 * 60 * 1000));
+    const startDate = now.toISOString().slice(0, 10);
+    const expDate = new Date(now.getTime() + 365 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
 
-    // Génération de l’ID client séquentiel fiable
+    // Génére l’ID client (optionnel)
+    // Récupère la dernière ligne pour incrémenter
     const read = await sheets.spreadsheets.values.get({
       spreadsheetId: process.env.SHEET_ID,
       range: 'FormResponses!C:C'
     });
-    // Ne garde que les IDs numériques existants
-    const ids = (read.data.values || [])
-      .map(row => row[0])
-      .filter(val => val && !isNaN(val));
-    const lastId = ids.length > 0 ? parseInt(ids[ids.length - 1], 10) : 0;
-    const nextIdNum = lastId + 1;
+    const nextIdNum = read.data.values && read.data.values.length ? parseInt(read.data.values.slice(-1)[0][0] || "0", 10) + 1 : 1;
     const clientId = ("00000" + nextIdNum).slice(-5);
 
-    // Ajoute la nouvelle ligne dans la sheet
     await sheets.spreadsheets.values.append({
       spreadsheetId: process.env.SHEET_ID,
       range: 'FormResponses!A:E',
@@ -133,20 +119,15 @@ cron.schedule('0 10 * * *', async () => { // tous les jours à 10h (UTC)
     if (!resp.data.values) return;
 
     for (let row of resp.data.values) {
-      const [userId, , , , expDateStr] = row;
-      if (!userId || !expDateStr) continue;
-
-      // Reconvertir la date au format ISO pour le calcul de différence de jours
-      const [day, month, year] = expDateStr.split('/');
-      const expDate = new Date(`${year}-${month}-${day}`);
-
-      const diff = Math.ceil((expDate - today) / (1000 * 3600 * 24));
+      const [userId, , , , expDate] = row;
+      if (!userId || !expDate) continue;
+      const diff = Math.ceil((new Date(expDate) - today) / (1000 * 3600 * 24));
       const reminder = reminders.find(r => r.days === diff);
       if (reminder) {
         try {
           const guild = await client.guilds.fetch(process.env.GUILD_ID);
           const member = await guild.members.fetch(userId);
-          await member.send(`⏰ Rappel : ton rôle client expire ${reminder.msg} (le ${expDateStr}). Pense à renouveler ton accès !`);
+          await member.send(`⏰ Rappel : ton rôle client expire ${reminder.msg} (le ${expDate}). Pense à renouveler ton accès !`);
         } catch (e) {
           console.log("Rappel impossible à ", userId, e.message);
         }
