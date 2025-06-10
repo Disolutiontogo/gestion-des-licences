@@ -8,7 +8,9 @@ import dotenv from 'dotenv';
 dotenv.config();
 
 const app = express();
+app.use(express.json());
 
+// Format JJ/MM/AAAA
 function formatDate(date) {
   const d = new Date(date);
   const day = String(d.getDate()).padStart(2, '0');
@@ -27,9 +29,8 @@ client.once('ready', () => {
   console.log('🤖 Discord bot connecté !');
 });
 
-// Utilise express.raw pour la route interactions
+// Utilise express.raw pour la route interactions (signature check Discord)
 app.post('/interactions', express.raw({ type: 'application/json' }), async (req, res) => {
-  // --- Sécurité Discord Signature ---
   try {
     const signature = req.headers['x-signature-ed25519'];
     const timestamp = req.headers['x-signature-timestamp'];
@@ -40,7 +41,6 @@ app.post('/interactions', express.raw({ type: 'application/json' }), async (req,
       Buffer.from(signature, 'hex'),
       Buffer.from(process.env.PUBLIC_KEY, 'hex')
     );
-
     if (!isVerified) {
       return res.status(401).send('invalid request signature');
     }
@@ -57,98 +57,81 @@ app.post('/interactions', express.raw({ type: 'application/json' }), async (req,
     const userId = data.options.find(o => o.name === 'user').value;
     const proof = data.options.find(o => o.name === 'proof').value;
 
-    // Dates & ID client incrémental
+    // Dates
     const now = new Date();
     const startDate = formatDate(now);
     const expDate = formatDate(new Date(now.getTime() + 365 * 24 * 60 * 60 * 1000));
 
-    // --- On répond à Discord TOUT DE SUITE pour éviter tout timeout ! ---
-    // On construit l'ID client dans la tâche de fond.
-    res.json({
-      type: 4,
-      data: {
-        content: `⏳ Validation en cours pour <@${userId}>...`
+    // Google Sheets setup
+    const credentials = JSON.parse(process.env.GOOGLE_CREDS);
+    const auth = new google.auth.GoogleAuth({
+      credentials,
+      scopes: ['https://www.googleapis.com/auth/spreadsheets'],
+    });
+    const sheets = google.sheets({ version: 'v4', auth });
+
+    // ---- ID client incrémental à 5 chiffres ----
+    const read = await sheets.spreadsheets.values.get({
+      spreadsheetId: process.env.SHEET_ID,
+      range: 'FormResponses!C:C'
+    });
+    const ids = (read.data.values || [])
+      .map(row => row[0])
+      .filter(val => val && /^\d+$/.test(val));
+    let lastNum = 0;
+    if (ids.length > 0) {
+      lastNum = parseInt(ids[ids.length - 1], 10);
+    }
+    const nextNum = lastNum + 1;
+    const clientId = String(nextNum).padStart(5, '0'); // Ex: 00001, 00002
+
+    // Ajoute la nouvelle ligne dans la sheet
+    await sheets.spreadsheets.values.append({
+      spreadsheetId: process.env.SHEET_ID,
+      range: 'FormResponses!A:E',
+      valueInputOption: 'USER_ENTERED',
+      resource: {
+        values: [[userId, proof, clientId, startDate, expDate]]
       }
     });
 
-    // --- Traite la suite en tâche de fond, sans bloquer Discord ---
-    (async () => {
-      try {
-        // Google Sheets setup
-        const credentials = JSON.parse(process.env.GOOGLE_CREDS);
-        const auth = new google.auth.GoogleAuth({
-          credentials,
-          scopes: ['https://www.googleapis.com/auth/spreadsheets'],
-        });
-        const sheets = google.sheets({ version: 'v4', auth });
+    // Discord: ajoute le rôle client et retire prospect
+    const guild = await client.guilds.fetch(process.env.GUILD_ID);
+    const member = await guild.members.fetch(userId);
+    const clientRole = guild.roles.cache.find(r => r.name === "client");
+    const prospectRole = guild.roles.cache.find(r => r.name === "prospect");
 
-        // Cherche le dernier ID
-        const read = await sheets.spreadsheets.values.get({
-          spreadsheetId: process.env.SHEET_ID,
-          range: 'FormResponses!C:C'
-        });
-        const ids = (read.data.values || [])
-          .map(row => row[0])
-          .filter(val => val && /^CLT-\d+$/.test(val));
-        let lastNum = 0;
-        if (ids.length > 0) {
-          const matches = ids[ids.length - 1].match(/^CLT-(\d+)$/);
-          if (matches) lastNum = parseInt(matches[1], 10);
-        }
-        const nextNum = lastNum + 1;
-        const clientId = `CLT-${String(nextNum).padStart(5, '0')}`;
-
-        // Ajoute la nouvelle ligne dans la sheet
-        await sheets.spreadsheets.values.append({
-          spreadsheetId: process.env.SHEET_ID,
-          range: 'FormResponses!A:E',
-          valueInputOption: 'USER_ENTERED',
-          resource: {
-            values: [[userId, proof, clientId, startDate, expDate]]
-          }
-        });
-
-        // Discord: ajoute le rôle client et retire prospect
-        const guild = await client.guilds.fetch(process.env.GUILD_ID);
-        const member = await guild.members.fetch(userId);
-        const clientRole = guild.roles.cache.find(r => r.name === "client");
-        const prospectRole = guild.roles.cache.find(r => r.name === "prospect");
-
-        if (clientRole && member) {
-          await member.roles.add(clientRole);
-          if (prospectRole && member.roles.cache.has(prospectRole.id)) {
-            await member.roles.remove(prospectRole);
-          }
-          try {
-            await member.send(`🎉 Paiement validé, tu as reçu le rôle client pour 1 an (jusqu’au ${expDate}) ! Ton ID client est ${clientId}`);
-          } catch (e) {
-            console.log("Impossible d’envoyer le DM à ce membre (DM fermés).");
-          }
-        }
-
-        // Envoie une notification dans le salon Discord (optionnel : pour retour visuel à l’admin)
-        // const channel = guild.channels.cache.get(process.env.LOG_CHANNEL_ID);
-        // if (channel) {
-        //   channel.send(`✅ Validation réussie pour <@${userId}>. • ID client : ${clientId} • Début : ${startDate} • Expiration : ${expDate}`);
-        // }
-      } catch (err) {
-        console.error('Erreur de fond (sheet/roles) :', err);
-        // Ici tu peux log ou même envoyer un DM à l'admin si besoin
+    if (clientRole && member) {
+      await member.roles.add(clientRole);
+      if (prospectRole && member.roles.cache.has(prospectRole.id)) {
+        await member.roles.remove(prospectRole);
       }
-    })();
+      try {
+        await member.send(`🎉 Paiement validé, tu as reçu le rôle client pour 1 an (jusqu’au ${expDate}) ! Ton ID client est ${clientId}`);
+      } catch (e) {
+        console.log("Impossible d’envoyer le DM à ce membre (DM fermés).");
+      }
+    }
+
+    // Répond dans Discord (dans le salon de la commande)
+    res.json({
+      type: 4,
+      data: {
+        content:
+          `✅ Validation réussie pour <@${userId}>.\n• ID client : ${clientId}\n• Début de licence : ${startDate}\n• Expiration : ${expDate}\n\n🎉 Le rôle client a été attribué automatiquement !`
+      }
+    });
 
   } catch (err) {
     console.error('Erreur sur /interactions:', err);
-    // Si ça plante AVANT la réponse, Discord aura une erreur.
-    // Mais ce cas est extrêmement rare avec ce flow.
-    return res.json({
+    res.json({
       type: 4,
       data: { content: '❌ Erreur lors de la validation. Merci de réessayer.' }
     });
   }
 });
 
-// CRON notifications de rappel automatisées (pas modifié)
+// CRON notifications de rappel automatisées (inchangé)
 cron.schedule('0 10 * * *', async () => {
   try {
     const credentials = JSON.parse(process.env.GOOGLE_CREDS);
