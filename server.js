@@ -1,4 +1,5 @@
 import express from 'express';
+import nacl from 'tweetnacl';
 import { Client, GatewayIntentBits, Partials } from 'discord.js';
 import { google } from 'googleapis';
 import cron from 'node-cron';
@@ -7,42 +8,27 @@ import dotenv from 'dotenv';
 dotenv.config();
 
 const app = express();
-app.use(express.json());
 
-// Discord bot setup
-const client = new Client({
-  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers],
-  partials: [Partials.GuildMember],
-});
+// Utilise express.raw pour la route interactions (obligatoire Discord signature)
+app.post('/interactions', express.raw({ type: 'application/json' }), async (req, res) => {
+  // --- Sécurité Discord Signature ---
+  const signature = req.headers['x-signature-ed25519'];
+  const timestamp = req.headers['x-signature-timestamp'];
+  const rawBody = req.body.toString(); // pour verification
 
-client.login(process.env.BOT_TOKEN);
+  const isVerified = nacl.sign.detached.verify(
+    Buffer.from(timestamp + rawBody),
+    Buffer.from(signature, 'hex'),
+    Buffer.from(process.env.PUBLIC_KEY, 'hex')
+  );
 
-client.once('ready', () => {
-  console.log('🤖 Discord bot connecté !');
-});
+  if (!isVerified) {
+    return res.status(401).send('invalid request signature');
+  }
 
-// Google Sheets setup
-const credentials = JSON.parse(process.env.GOOGLE_CREDS);
-
-const auth = new google.auth.GoogleAuth({
-  credentials,
-  scopes: ['https://www.googleapis.com/auth/spreadsheets'],
-});
-const sheets = google.sheets({ version: 'v4', auth });
-
-// Fonction utilitaire pour format JJ/MM/AAAA
-function formatDate(date) {
-  const d = new Date(date);
-  const day = String(d.getDate()).padStart(2, '0');
-  const month = String(d.getMonth() + 1).padStart(2, '0');
-  const year = d.getFullYear();
-  return `${day}/${month}/${year}`;
-}
-
-// Endpoint Discord Interactions
-app.post('/interactions', async (req, res) => {
+  // --- Traitement habituel ---
   try {
-    const body = req.body;
+    const body = JSON.parse(rawBody);
 
     // Répond au ping Discord
     if (body.type === 1) {
@@ -54,24 +40,39 @@ app.post('/interactions', async (req, res) => {
     const userId = data.options.find(o => o.name === 'user').value;
     const proof = data.options.find(o => o.name === 'proof').value;
 
-    // Sheets: ajoute l'utilisateur
+    // Dates au format JJ/MM/AAAA
+    function formatDate(date) {
+      const d = new Date(date);
+      const day = String(d.getDate()).padStart(2, '0');
+      const month = String(d.getMonth() + 1).padStart(2, '0');
+      const year = d.getFullYear();
+      return `${day}/${month}/${year}`;
+    }
     const now = new Date();
     const startDate = formatDate(now);
     const expDate = formatDate(new Date(now.getTime() + 365 * 24 * 60 * 60 * 1000));
 
-    // Génére l’ID client (optionnel)
-    // Récupère la dernière ligne pour incrémenter
+    // Google Sheets setup
+    const credentials = JSON.parse(process.env.GOOGLE_CREDS);
+    const auth = new google.auth.GoogleAuth({
+      credentials,
+      scopes: ['https://www.googleapis.com/auth/spreadsheets'],
+    });
+    const sheets = google.sheets({ version: 'v4', auth });
+
+    // ---- ID client séquentiel et formaté 00001 ---
     const read = await sheets.spreadsheets.values.get({
       spreadsheetId: process.env.SHEET_ID,
       range: 'FormResponses!C:C'
     });
     const ids = (read.data.values || [])
       .map(row => row[0])
-      .filter(val => val && !isNaN(val));
+      .filter(val => val && /^\d+$/.test(val));
     const lastId = ids.length > 0 ? parseInt(ids[ids.length - 1], 10) : 0;
     const nextIdNum = lastId + 1;
     const clientId = ("00000" + nextIdNum).slice(-5);
 
+    // Ajoute la nouvelle ligne dans la sheet (avec clientId formaté)
     await sheets.spreadsheets.values.append({
       spreadsheetId: process.env.SHEET_ID,
       range: 'FormResponses!A:E',
@@ -81,7 +82,19 @@ app.post('/interactions', async (req, res) => {
       }
     });
 
-    // Discord: ajoute le rôle client au membre
+    // Discord bot pour rôle client
+    const client = global.discordClient || new Client({
+      intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers],
+      partials: [Partials.GuildMember],
+    });
+
+    if (!global.discordClient) {
+      client.login(process.env.BOT_TOKEN);
+      global.discordClient = client;
+      // attends qu'il soit prêt la première fois
+      await new Promise(resolve => client.once('ready', resolve));
+    }
+
     const guild = await client.guilds.fetch(process.env.GUILD_ID);
     const member = await guild.members.fetch(userId);
     const role = guild.roles.cache.find(r => r.name === "client");
@@ -115,9 +128,28 @@ app.post('/interactions', async (req, res) => {
   }
 });
 
-// Notifications de rappel automatisées
+// -- Discord bot lancement global et CRON séparé --
+const client = new Client({
+  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers],
+  partials: [Partials.GuildMember],
+});
+client.login(process.env.BOT_TOKEN);
+
+client.once('ready', () => {
+  console.log('🤖 Discord bot connecté !');
+});
+
+// CRON notifications de rappel automatisées
 cron.schedule('0 10 * * *', async () => { // tous les jours à 10h (UTC)
   try {
+    // Google Sheets setup
+    const credentials = JSON.parse(process.env.GOOGLE_CREDS);
+    const auth = new google.auth.GoogleAuth({
+      credentials,
+      scopes: ['https://www.googleapis.com/auth/spreadsheets'],
+    });
+    const sheets = google.sheets({ version: 'v4', auth });
+
     const resp = await sheets.spreadsheets.values.get({
       spreadsheetId: process.env.SHEET_ID,
       range: 'FormResponses!A:E'
@@ -134,11 +166,9 @@ cron.schedule('0 10 * * *', async () => { // tous les jours à 10h (UTC)
     for (let row of resp.data.values) {
       const [userId, , , , expDateStr] = row;
       if (!userId || !expDateStr) continue;
-
       // Reconvertir la date JJ/MM/AAAA → ISO
       const [day, month, year] = expDateStr.split('/');
       const expDate = new Date(`${year}-${month}-${day}`);
-
       const diff = Math.ceil((expDate - today) / (1000 * 3600 * 24));
       const reminder = reminders.find(r => r.days === diff);
       if (reminder) {
