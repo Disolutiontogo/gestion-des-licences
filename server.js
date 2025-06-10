@@ -9,12 +9,12 @@ dotenv.config();
 
 const app = express();
 
-// Utilise express.raw pour la route interactions (obligatoire Discord signature)
+// Utilise express.raw pour la route interactions
 app.post('/interactions', express.raw({ type: 'application/json' }), async (req, res) => {
   // --- Sécurité Discord Signature ---
   const signature = req.headers['x-signature-ed25519'];
   const timestamp = req.headers['x-signature-timestamp'];
-  const rawBody = req.body.toString(); // pour verification
+  const rawBody = req.body.toString();
 
   const isVerified = nacl.sign.detached.verify(
     Buffer.from(timestamp + rawBody),
@@ -26,7 +26,6 @@ app.post('/interactions', express.raw({ type: 'application/json' }), async (req,
     return res.status(401).send('invalid request signature');
   }
 
-  // --- Traitement habituel ---
   try {
     const body = JSON.parse(rawBody);
 
@@ -40,7 +39,7 @@ app.post('/interactions', express.raw({ type: 'application/json' }), async (req,
     const userId = data.options.find(o => o.name === 'user').value;
     const proof = data.options.find(o => o.name === 'proof').value;
 
-    // Dates au format JJ/MM/AAAA
+    // Fonction format JJ/MM/AAAA
     function formatDate(date) {
       const d = new Date(date);
       const day = String(d.getDate()).padStart(2, '0');
@@ -60,19 +59,30 @@ app.post('/interactions', express.raw({ type: 'application/json' }), async (req,
     });
     const sheets = google.sheets({ version: 'v4', auth });
 
-    // ---- ID client séquentiel et formaté 00001 ---
-    const read = await sheets.spreadsheets.values.get({
-      spreadsheetId: process.env.SHEET_ID,
-      range: 'FormResponses!C:C'
-    });
-    const ids = (read.data.values || [])
-      .map(row => row[0])
-      .filter(val => val && /^\d+$/.test(val));
-    const lastId = ids.length > 0 ? parseInt(ids[ids.length - 1], 10) : 0;
-    const nextIdNum = lastId + 1;
-    const clientId = ("00000" + nextIdNum).slice(-5);
+    // ---- ID client alphanumérique, unique, format CLT-XXXXX ----
+    function randomAlphanum(size = 5) {
+      const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+      let out = '';
+      for (let i = 0; i < size; i++) out += chars[Math.floor(Math.random() * chars.length)];
+      return out;
+    }
+    let clientId = `CLT-${randomAlphanum(5)}`;
+    // Vérifier l'unicité dans la Sheet
+    let isUnique = false;
+    while (!isUnique) {
+      const read = await sheets.spreadsheets.values.get({
+        spreadsheetId: process.env.SHEET_ID,
+        range: 'FormResponses!C:C'
+      });
+      const ids = (read.data.values || []).map(row => row[0]);
+      if (!ids.includes(clientId)) {
+        isUnique = true;
+      } else {
+        clientId = `CLT-${randomAlphanum(5)}`;
+      }
+    }
 
-    // Ajoute la nouvelle ligne dans la sheet (avec clientId formaté)
+    // Ajoute la nouvelle ligne dans la sheet (clientId alphanum)
     await sheets.spreadsheets.values.append({
       spreadsheetId: process.env.SHEET_ID,
       range: 'FormResponses!A:E',
@@ -91,20 +101,25 @@ app.post('/interactions', express.raw({ type: 'application/json' }), async (req,
     if (!global.discordClient) {
       client.login(process.env.BOT_TOKEN);
       global.discordClient = client;
-      // attends qu'il soit prêt la première fois
       await new Promise(resolve => client.once('ready', resolve));
     }
 
     const guild = await client.guilds.fetch(process.env.GUILD_ID);
     const member = await guild.members.fetch(userId);
-    const role = guild.roles.cache.find(r => r.name === "client");
+    const clientRole = guild.roles.cache.find(r => r.name === "client");
+    const prospectRole = guild.roles.cache.find(r => r.name === "prospect");
 
-    if (role && member) {
-      await member.roles.add(role);
+    if (clientRole && member) {
+      await member.roles.add(clientRole);
+
+      // S'il a le rôle prospect, on le retire
+      if (prospectRole && member.roles.cache.has(prospectRole.id)) {
+        await member.roles.remove(prospectRole);
+      }
 
       // Message privé à l'utilisateur
       try {
-        await member.send(`🎉 Paiement validé, tu as reçu le rôle client pour 1 an (jusqu’au ${expDate}) !`);
+        await member.send(`🎉 Paiement validé, tu as reçu le rôle client pour 1 an (jusqu’au ${expDate}) ! Ton ID client est ${clientId}`);
       } catch (e) {
         console.log("Impossible d’envoyer le DM à ce membre (DM fermés).");
       }
@@ -140,9 +155,8 @@ client.once('ready', () => {
 });
 
 // CRON notifications de rappel automatisées
-cron.schedule('0 10 * * *', async () => { // tous les jours à 10h (UTC)
+cron.schedule('0 10 * * *', async () => {
   try {
-    // Google Sheets setup
     const credentials = JSON.parse(process.env.GOOGLE_CREDS);
     const auth = new google.auth.GoogleAuth({
       credentials,
@@ -166,7 +180,6 @@ cron.schedule('0 10 * * *', async () => { // tous les jours à 10h (UTC)
     for (let row of resp.data.values) {
       const [userId, , , , expDateStr] = row;
       if (!userId || !expDateStr) continue;
-      // Reconvertir la date JJ/MM/AAAA → ISO
       const [day, month, year] = expDateStr.split('/');
       const expDate = new Date(`${year}-${month}-${day}`);
       const diff = Math.ceil((expDate - today) / (1000 * 3600 * 24));
