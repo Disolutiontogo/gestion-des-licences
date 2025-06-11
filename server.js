@@ -51,8 +51,69 @@ app.post('/interactions', express.raw({ type: 'application/json' }), async (req,
     const sheets = google.sheets({ version: 'v4', auth });
 
     if (data.name === 'validate') {
-      // ... ta logique validate ici (inchangée)
-      // Je ne la copie pas ici pour rester concentré sur renew
+      const userId = data.options.find(o => o.name === 'user').value;
+      const proof = data.options.find(o => o.name === 'proof').value;
+
+      const now = new Date();
+      const startDate = formatDate(now);
+      const expDate = formatDate(new Date(now.getTime() + 365 * 24 * 60 * 60 * 1000));
+      const creationDate = startDate;
+
+      const read = await sheets.spreadsheets.values.get({
+        spreadsheetId: process.env.SHEET_ID,
+        range: 'FormResponses!C:C'
+      });
+
+      const ids = (read.data.values || [])
+        .map(row => row[0])
+        .filter(val => val && val.startsWith('CLT-'))
+        .map(val => parseInt(val.replace('CLT-', ''), 10))
+        .filter(num => !isNaN(num));
+
+      const lastId = ids.length > 0 ? Math.max(...ids) : 0;
+      const nextIdNum = lastId + 1;
+      const clientId = `CLT-${("00000" + nextIdNum).slice(-5)}`;
+
+      await sheets.spreadsheets.values.append({
+        spreadsheetId: process.env.SHEET_ID,
+        range: 'FormResponses!A:G',
+        valueInputOption: 'USER_ENTERED',
+        resource: {
+          values: [[userId, proof, clientId, startDate, expDate, creationDate, 0]]
+        }
+      });
+
+      const guild = await client.guilds.fetch(process.env.GUILD_ID);
+      const member = await guild.members.fetch(userId);
+      const clientRole = guild.roles.cache.find(r => r.name === "client");
+      const prospectRole = guild.roles.cache.find(r => r.name === "prospect");
+
+      if (clientRole && member) {
+        await member.roles.add(clientRole);
+
+        if (prospectRole && member.roles.cache.has(prospectRole.id)) {
+          await member.roles.remove(prospectRole);
+        }
+
+        try {
+          await member.send(
+            `🎉 Paiement validé !\n` +
+            `Ton rôle client a été activé pour 1 an (jusqu’au ${expDate}).\n` +
+            `Ton code client est : **${clientId}**\n` +
+            `Garde-le précieusement et communique-le dans le canal /carte-membres pour recevoir ta carte membre.`
+          );
+        } catch {
+          console.log("Impossible d’envoyer le DM (DM fermés).");
+        }
+      }
+
+      return res.json({
+        type: 4,
+        data: {
+          content:
+            `✅ Validation réussie pour <@${userId}>.\n• ID client : ${clientId}\n• Début de licence : ${startDate}\n• Expiration : ${expDate}\n\n🎉 Le rôle client a été attribué automatiquement et le rôle prospect retiré !`
+        }
+      });
     }
 
     if (data.name === 'renew') {
@@ -144,6 +205,19 @@ app.post('/interactions', express.raw({ type: 'application/json' }), async (req,
         }
       });
 
+      // Envoi DM pour renouvellement
+      try {
+        const guild = await client.guilds.fetch(process.env.GUILD_ID);
+        const member = await guild.members.fetch(rows[rowIndex][0]); // Col A = Discord User ID (à confirmer)
+
+        await member.send(
+          `🎉 Félicitations ! Ta licence a été renouvelée avec succès.\n` +
+          `La nouvelle date d'expiration est le ${expDate}.`
+        );
+      } catch {
+        console.log("Impossible d’envoyer le DM de renouvellement (DM fermés).");
+      }
+
       return res.json({
         type: 4,
         data: {
@@ -166,7 +240,6 @@ app.post('/interactions', express.raw({ type: 'application/json' }), async (req,
   }
 });
 
-// Setup Discord bot (inchangé, pareil que ta version)
 const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers],
   partials: [Partials.GuildMember],
@@ -178,7 +251,52 @@ client.once('ready', () => {
   console.log('🤖 Discord bot connecté !');
 });
 
-// Cron inchangé ici...
+cron.schedule('0 10 * * *', async () => {
+  try {
+    const credentials = JSON.parse(process.env.GOOGLE_CREDS);
+    const auth = new google.auth.GoogleAuth({
+      credentials,
+      scopes: ['https://www.googleapis.com/auth/spreadsheets'],
+    });
+    const sheets = google.sheets({ version: 'v4', auth });
+
+    const resp = await sheets.spreadsheets.values.get({
+      spreadsheetId: process.env.SHEET_ID,
+      range: 'FormResponses!A:E'
+    });
+
+    const today = new Date();
+    const reminders = [
+      { days: 30, msg: "dans 1 mois" },
+      { days: 14, msg: "dans 2 semaines" },
+      { days: 1, msg: "demain" }
+    ];
+
+    if (!resp.data.values) return;
+
+    for (let row of resp.data.values) {
+      const [userId, , , , expDateStr] = row;
+      if (!userId || !expDateStr) continue;
+
+      const [day, month, year] = expDateStr.split('/');
+      const expDate = new Date(`${year}-${month}-${day}`);
+
+      const diff = Math.ceil((expDate - today) / (1000 * 3600 * 24));
+      const reminder = reminders.find(r => r.days === diff);
+      if (reminder) {
+        try {
+          const guild = await client.guilds.fetch(process.env.GUILD_ID);
+          const member = await guild.members.fetch(userId);
+          await member.send(`⏰ Rappel : ton rôle client expire ${reminder.msg} (le ${expDateStr}). Pense à renouveler ton accès !`);
+        } catch (e) {
+          console.log("Rappel impossible à ", userId, e.message);
+        }
+      }
+    }
+  } catch (e) {
+    console.log("Erreur CRON Google Sheets :", e.message);
+  }
+});
 
 app.listen(process.env.PORT || 3000, () => {
   console.log("Server ready on http://localhost:" + (process.env.PORT || 3000));
