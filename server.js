@@ -64,7 +64,7 @@ app.post('/interactions', express.raw({ type: 'application/json' }), async (req,
     const startDate = formatDate(now);
     const expDate = formatDate(new Date(now.getTime() + 365 * 24 * 60 * 60 * 1000));
 
-    // Lire la dernière ID client dans la colonne C
+    // Lire la dernière ID client au format CLT-XXXXX dans la colonne C
     const read = await sheets.spreadsheets.values.get({
       spreadsheetId: process.env.SHEET_ID,
       range: 'FormResponses!C:C'
@@ -72,10 +72,13 @@ app.post('/interactions', express.raw({ type: 'application/json' }), async (req,
 
     const ids = (read.data.values || [])
       .map(row => row[0])
-      .filter(val => val && !isNaN(val));
-    const lastId = ids.length > 0 ? parseInt(ids[ids.length - 1], 10) : 0;
+      .filter(val => val && val.startsWith('CLT-'))
+      .map(val => parseInt(val.replace('CLT-', ''), 10))
+      .filter(num => !isNaN(num));
+
+    const lastId = ids.length > 0 ? Math.max(...ids) : 0;
     const nextIdNum = lastId + 1;
-    const clientId = ("00000" + nextIdNum).slice(-5);
+    const clientId = `CLT-${("00000" + nextIdNum).slice(-5)}`;
 
     // Append dans la feuille
     await sheets.spreadsheets.values.append({
@@ -90,10 +93,20 @@ app.post('/interactions', express.raw({ type: 'application/json' }), async (req,
     // Discord client (déjà connecté plus bas)
     const guild = await client.guilds.fetch(process.env.GUILD_ID);
     const member = await guild.members.fetch(userId);
-    const role = guild.roles.cache.find(r => r.name === "client");
 
-    if (role && member) {
-      await member.roles.add(role);
+    // Récupérer les rôles client et prospect
+    const clientRole = guild.roles.cache.find(r => r.name === "client");
+    const prospectRole = guild.roles.cache.find(r => r.name === "prospect");
+
+    if (clientRole && member) {
+      // Ajout du rôle client
+      await member.roles.add(clientRole);
+
+      // Suppression du rôle prospect si présent
+      if (prospectRole && member.roles.cache.has(prospectRole.id)) {
+        await member.roles.remove(prospectRole);
+      }
+
       try {
         await member.send(`🎉 Paiement validé, tu as reçu le rôle client pour 1 an (jusqu’au ${expDate}) !`);
       } catch {
@@ -105,7 +118,7 @@ app.post('/interactions', express.raw({ type: 'application/json' }), async (req,
       type: 4,
       data: {
         content:
-          `✅ Validation réussie pour <@${userId}>.\n• ID client : ${clientId}\n• Début de licence : ${startDate}\n• Expiration : ${expDate}\n\n🎉 Le rôle client a été attribué automatiquement !`
+          `✅ Validation réussie pour <@${userId}>.\n• ID client : ${clientId}\n• Début de licence : ${startDate}\n• Expiration : ${expDate}\n\n🎉 Le rôle client a été attribué automatiquement et le rôle prospect retiré !`
       }
     });
 
@@ -130,7 +143,7 @@ client.once('ready', () => {
   console.log('🤖 Discord bot connecté !');
 });
 
-// Cron notifications (tu peux laisser tel quel)
+// Cron notifications (inchangé)
 cron.schedule('0 10 * * *', async () => {
   try {
     const credentials = JSON.parse(process.env.GOOGLE_CREDS);
