@@ -24,11 +24,15 @@ const commands = [
 ];
 
 (async () => {
-  const rest = new REST({ version: '10' }).setToken(BOT_TOKEN);
-  console.log('🚀 Enregistrement des commandes…');
-  await rest.put(
-    Routes.applicationGuildCommands(APPLICATION_ID, GUILD_ID),
-    { body: commands }
-  );
-  console.log('✅ Commandes enregistrées !');
+  try {
+    const rest = new REST({ version: '10' }).setToken(BOT_TOKEN);
+    console.log('🚀 Enregistrement des commandes…');
+    await rest.put(
+      Routes.applicationGuildCommands(APPLICATION_ID, GUILD_ID),
+      { body: commands }
+    );
+    console.log('✅ Commandes enregistrées !');
+  } catch (error) {
+    console.error('Erreur lors de l’enregistrement des commandes :', error);
+  }
 })();
