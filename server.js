@@ -1,4 +1,5 @@
 import express from 'express';
+import nacl from 'tweetnacl';
 import { Client, GatewayIntentBits, Partials } from 'discord.js';
 import { google } from 'googleapis';
 import cron from 'node-cron';
@@ -7,64 +8,68 @@ import dotenv from 'dotenv';
 dotenv.config();
 
 const app = express();
-app.use(express.json());
 
-// Discord bot setup
-const client = new Client({
-  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers],
-  partials: [Partials.GuildMember],
-});
-
-client.login(process.env.BOT_TOKEN);
-
-client.once('ready', () => {
-  console.log('🤖 Discord bot connecté !');
-});
-
-// Google Sheets setup
-const credentials = JSON.parse(process.env.GOOGLE_CREDS);
-
-const auth = new google.auth.GoogleAuth({
-  credentials,
-  scopes: ['https://www.googleapis.com/auth/spreadsheets'],
-});
-const sheets = google.sheets({ version: 'v4', auth });
-
-// Fonction utilitaire pour format JJ/MM/AAAA
-function formatDate(date) {
-  const d = new Date(date);
-  const day = String(d.getDate()).padStart(2, '0');
-  const month = String(d.getMonth() + 1).padStart(2, '0');
-  const year = d.getFullYear();
-  return `${day}/${month}/${year}`;
-}
-
-// Endpoint Discord Interactions
-app.post('/interactions', async (req, res) => {
+// Utiliser express.raw pour /interactions pour garder le corps brut
+app.post('/interactions', express.raw({ type: 'application/json' }), async (req, res) => {
   try {
-    const body = req.body;
+    const signature = req.headers['x-signature-ed25519'];
+    const timestamp = req.headers['x-signature-timestamp'];
+    const rawBody = req.body; // Buffer brut
 
-    // Répond au ping Discord
+    if (!signature || !timestamp) {
+      return res.status(401).send('Unauthorized: missing signature headers');
+    }
+
+    const isVerified = nacl.sign.detached.verify(
+      Buffer.from(timestamp + rawBody.toString()),
+      Buffer.from(signature, 'hex'),
+      Buffer.from(process.env.PUBLIC_KEY, 'hex')
+    );
+
+    if (!isVerified) {
+      return res.status(401).send('Unauthorized: invalid request signature');
+    }
+
+    // Parse JSON uniquement après validation
+    const body = JSON.parse(rawBody.toString());
+
+    // Ping de Discord (type 1)
     if (body.type === 1) {
       return res.json({ type: 1 });
     }
 
-    // Récupère les infos de la commande
+    // Récupérer les options
     const data = body.data;
     const userId = data.options.find(o => o.name === 'user').value;
     const proof = data.options.find(o => o.name === 'proof').value;
 
-    // Sheets: ajoute l'utilisateur
+    // Initialiser Google Sheets
+    const credentials = JSON.parse(process.env.GOOGLE_CREDS);
+    const auth = new google.auth.GoogleAuth({
+      credentials,
+      scopes: ['https://www.googleapis.com/auth/spreadsheets'],
+    });
+    const sheets = google.sheets({ version: 'v4', auth });
+
+    // Dates formatées
+    function formatDate(date) {
+      const d = new Date(date);
+      const day = String(d.getDate()).padStart(2, '0');
+      const month = String(d.getMonth() + 1).padStart(2, '0');
+      const year = d.getFullYear();
+      return `${day}/${month}/${year}`;
+    }
+
     const now = new Date();
     const startDate = formatDate(now);
     const expDate = formatDate(new Date(now.getTime() + 365 * 24 * 60 * 60 * 1000));
 
-    // Génére l’ID client (optionnel)
-    // Récupère la dernière ligne pour incrémenter
+    // Lire la dernière ID client dans la colonne C
     const read = await sheets.spreadsheets.values.get({
       spreadsheetId: process.env.SHEET_ID,
       range: 'FormResponses!C:C'
     });
+
     const ids = (read.data.values || [])
       .map(row => row[0])
       .filter(val => val && !isNaN(val));
@@ -72,6 +77,7 @@ app.post('/interactions', async (req, res) => {
     const nextIdNum = lastId + 1;
     const clientId = ("00000" + nextIdNum).slice(-5);
 
+    // Append dans la feuille
     await sheets.spreadsheets.values.append({
       spreadsheetId: process.env.SHEET_ID,
       range: 'FormResponses!A:E',
@@ -81,24 +87,21 @@ app.post('/interactions', async (req, res) => {
       }
     });
 
-    // Discord: ajoute le rôle client au membre
+    // Discord client (déjà connecté plus bas)
     const guild = await client.guilds.fetch(process.env.GUILD_ID);
     const member = await guild.members.fetch(userId);
     const role = guild.roles.cache.find(r => r.name === "client");
 
     if (role && member) {
       await member.roles.add(role);
-
-      // Message privé à l'utilisateur
       try {
         await member.send(`🎉 Paiement validé, tu as reçu le rôle client pour 1 an (jusqu’au ${expDate}) !`);
-      } catch (e) {
-        console.log("Impossible d’envoyer le DM à ce membre (DM fermés).");
+      } catch {
+        console.log("Impossible d’envoyer le DM (DM fermés).");
       }
     }
 
-    // Répond dans Discord
-    res.json({
+    return res.json({
       type: 4,
       data: {
         content:
@@ -115,13 +118,33 @@ app.post('/interactions', async (req, res) => {
   }
 });
 
-// Notifications de rappel automatisées
-cron.schedule('0 10 * * *', async () => { // tous les jours à 10h (UTC)
+// Setup Discord bot
+const client = new Client({
+  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers],
+  partials: [Partials.GuildMember],
+});
+
+client.login(process.env.BOT_TOKEN);
+
+client.once('ready', () => {
+  console.log('🤖 Discord bot connecté !');
+});
+
+// Cron notifications (tu peux laisser tel quel)
+cron.schedule('0 10 * * *', async () => {
   try {
+    const credentials = JSON.parse(process.env.GOOGLE_CREDS);
+    const auth = new google.auth.GoogleAuth({
+      credentials,
+      scopes: ['https://www.googleapis.com/auth/spreadsheets'],
+    });
+    const sheets = google.sheets({ version: 'v4', auth });
+
     const resp = await sheets.spreadsheets.values.get({
       spreadsheetId: process.env.SHEET_ID,
       range: 'FormResponses!A:E'
     });
+
     const today = new Date();
     const reminders = [
       { days: 30, msg: "dans 1 mois" },
@@ -135,7 +158,6 @@ cron.schedule('0 10 * * *', async () => { // tous les jours à 10h (UTC)
       const [userId, , , , expDateStr] = row;
       if (!userId || !expDateStr) continue;
 
-      // Reconvertir la date JJ/MM/AAAA → ISO
       const [day, month, year] = expDateStr.split('/');
       const expDate = new Date(`${year}-${month}-${day}`);
 
@@ -156,7 +178,6 @@ cron.schedule('0 10 * * *', async () => { // tous les jours à 10h (UTC)
   }
 });
 
-// Express écoute sur le port Render
 app.listen(process.env.PORT || 3000, () => {
   console.log("Server ready on http://localhost:" + (process.env.PORT || 3000));
 });
